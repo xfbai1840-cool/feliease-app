@@ -2,5 +2,5 @@ streamlit
 pandas
 matplotlib
 numpy
-openpyxl
 xlsxwriter
+openpyxl
