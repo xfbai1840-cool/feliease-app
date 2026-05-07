@@ -1,133 +1,144 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 import io
 
 # ==========================================
-# 0. 网页配置
+# 0. 页面配置
 # ==========================================
-st.set_page_config(page_title="FeliEase 双荧光高通量筛选", layout="wide")
+st.set_page_config(page_title="FeliEase 3.0 | 双荧光重复分析", layout="wide")
 
-st.title("🧪 FeliEase 筛选分析平台 - 双荧光重复实验版")
+st.title("🧪 FeliEase 3.0 高通量双荧光筛选系统")
 st.markdown("""
-**更新说明：**
-- **双荧光归一化**：自动处理 Firefly(F) 和 Renilla(R) 的比值。
-- **3次重复合并**：自动匹配不同 Sheet 或文件的孔位。
-- **Z-score 统计**：计算 $Z = \frac{x - \mu}{\sigma}$，评估化合物抑制强度。
+该版本专为**重复实验**设计：
+1. **自动归一化**：计算 $Ratio = Firefly / Renilla$。
+2. **多样本合并**：上传 3 个重复文件，自动按孔位计算均值与偏差。
+3. **Z-score 统计**：基于整板数据计算 $Z = (x - \mu) / \sigma$，科学评估抑制强度。
 """)
 
-# 侧边栏：参数配置
+# 侧边栏参数
 with st.sidebar:
-    st.header("⚙️ 实验参数")
-    PLATE_HEIGHT = st.number_input("每板行数 (Data Rows)", value=8)
-    
+    st.header("⚙️ 分析参数设置")
+    PLATE_ROWS = st.number_input("板内数据行数 (如 B-M 共12行则填12)", value=8)
     st.divider()
-    THRESHOLD_Z = st.number_input("Z-score Hit 阈值 (通常 < -2 或 -3)", value=-2.0)
-    
-    st.info("默认设置：\n1. 自动根据 Plate_ID 和 Physical_Well 匹配3次重复。\n2. 计算公式：Normalized = F/R; Z = (Ratio - Mean)/Std")
+    Z_THRESHOLD = st.slider("Hit 判定阈值 (Z-score < ?)", -5.0, 0.0, -2.0, 0.1)
+    st.info("注：Z-score < -2 通常代表具有 95% 以上的统计学显著抑制。")
 
 # ==========================================
-# 1. 核心计算工具
+# 1. 核心解析函数 (适配原始 96 孔板 CSV)
 # ==========================================
-def process_single_file(df, plate_height):
-    """处理单个原始文件，提取 F 和 R 并归一化"""
+def parse_raw_csv(file):
+    """解析原始导出的 CSV，提取 ID, F 和 R"""
+    df = pd.read_csv(file, header=None)
     results = []
-    # 这里的索引逻辑需根据您的 CSV 布局微调
-    # 假设：A列ID, B列内参F, C-L列药物F, M列毒性F... 
-    # 此处为简化，假设上传的是清洗后的干净长表，若仍是原始排布，建议使用该函数进行解析
-    return df
+    
+    # 自动找板逻辑
+    i = 0
+    plate_count = 1
+    while i < len(df):
+        val = str(df.iloc[i, 0]).strip()
+        if val and val.lower() != 'nan':  # A列有板ID
+            if i + int(PLATE_ROWS) <= len(df):
+                plate_id = val
+                # 提取 F (B列=1) 和 R (M列=12) 以及中间的药物孔 (C-L列 = 2:12)
+                # 简化逻辑：这里假设用户上传的是已经简单清洗或标准的 96 孔数据分布
+                # 我们遍历 C-L 列 (药物孔)
+                for r in range(int(PLATE_ROWS)):
+                    for c in range(2, 12): # C列到L列
+                        f_val = pd.to_numeric(df.iloc[i+r, 1], errors='coerce')  # B列作为单行内参或对照
+                        r_val = pd.to_numeric(df.iloc[i+r, 12], errors='coerce') # M列作为海神内参
+                        drug_f = pd.to_numeric(df.iloc[i+r, c], errors='coerce')
+                        
+                        if not np.isnan(drug_f) and r_val > 0:
+                            well_id = f"{chr(65+r)}{c+1:02d}"
+                            results.append({
+                                "Plate_ID": plate_id,
+                                "Well": well_id,
+                                "F": drug_f,
+                                "R": r_val,
+                                "Ratio": drug_f / r_val
+                            })
+                plate_count += 1
+                i += int(PLATE_ROWS)
+            else: break
+        else: i += 1
+    return pd.DataFrame(results)
 
 # ==========================================
-# 2. 数据处理逻辑
+# 2. 主程序逻辑
 # ==========================================
-st.subheader("1️⃣ 上传数据")
-col_u1, col_u2 = st.columns(2)
-
+col_u1, col_u2 = st.columns([2, 1])
 with col_u1:
-    files = st.file_uploader("上传3个重复的实验结果 (CSV/XLSX)", type=["csv", "xlsx"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("1️⃣ 上传重复实验文件 (支持多个 CSV)", type="csv", accept_multiple_files=True)
 with col_u2:
-    lib_file = st.file_uploader("上传化合物库信息表", type=["csv", "xlsx"])
+    lib_file = st.file_uploader("2️⃣ 可选：上传化合物库信息", type=["xlsx", "csv"])
 
-if len(files) >= 1:
-    dfs = []
-    for f in files:
-        if f.name.endswith('.csv'):
-            tmp_df = pd.read_csv(f)
-        else:
-            tmp_df = pd.read_excel(f)
-        dfs.append(tmp_df)
+if uploaded_files:
+    all_reps = []
+    for idx, f in enumerate(uploaded_files):
+        rep_df = parse_raw_csv(f)
+        rep_df['Rep'] = f"Rep_{idx+1}"
+        all_reps.append(rep_df)
     
-    # 假设每个文件已有 Physical_Plate, Physical_Well, Firefly, Renilla 四列
-    # 如果没有，此处需要运行您之前的“自动找板”逻辑进行转换
-    
-    if len(dfs) > 0:
-        # 合并重复
-        try:
-            # 1. 基础合并
-            main_df = dfs[0].copy()
-            # 关键：计算单次实验的归一化比值
-            for i, d in enumerate(dfs):
-                # 计算 F/R
-                d[f'Ratio_Rep{i+1}'] = d['Firefly'] / d['Renilla']
-            
-            # 2. 纵向合并并计算均值
-            combined = pd.concat(dfs)
-            # 按孔位聚合
-            final_res = combined.groupby(['Physical_Plate', 'Physical_Well']).agg({
-                'Firefly': 'mean',
-                'Renilla': 'mean'
-            }).reset_index()
-            
-            # 计算平均 Ratio
-            final_res['Avg_Ratio'] = final_res['Firefly'] / final_res['Renilla']
-            
-            # 3. 计算 Z-score (基于所有药物孔的 Avg_Ratio)
-            mu = final_res['Avg_Ratio'].mean()
-            sigma = final_res['Avg_Ratio'].std()
-            final_res['Z_score'] = (final_res['Avg_Ratio'] - mu) / sigma
-            
-            # 4. 计算 3 次重复的 CV (变异系数) - 衡量实验质量
-            # 这里需要把 Rep1, Rep2, Rep3 横向拼起来算
-            
-            # 5. 判定 Hit
-            final_res['Is_Hit'] = final_res['Z_score'].apply(lambda x: "Yes" if x < THRESHOLD_Z else "No")
-            
-            # ==========================
-            # 关联库信息
-            # ==========================
-            if lib_file:
-                lib_df = pd.read_excel(lib_file) if lib_file.name.endswith('.xlsx') else pd.read_csv(lib_file)
-                final_res = pd.merge(final_res, lib_df, on=['Physical_Plate', 'Physical_Well'], how='left')
+    if all_reps:
+        combined_raw = pd.concat(all_reps)
+        
+        # 按板号和孔位进行聚合计算
+        final_df = combined_raw.groupby(['Plate_ID', 'Well']).agg({
+            'Ratio': ['mean', 'std', 'count'],
+            'F': 'mean',
+            'R': 'mean'
+        }).reset_index()
+        
+        # 展平列名
+        final_df.columns = ['Plate_ID', 'Well', 'Avg_Ratio', 'Std_Ratio', 'Count', 'Mean_F', 'Mean_R']
+        
+        # 计算变异系数 CV (衡量重复性)
+        final_df['CV_%'] = (final_df['Std_Ratio'] / final_df['Avg_Ratio']) * 100
+        
+        # 计算全局 Z-score
+        mu = final_df['Avg_Ratio'].mean()
+        sigma = final_df['Avg_Ratio'].std()
+        final_df['Z_score'] = (final_df['Avg_Ratio'] - mu) / sigma
+        
+        # 判定 Hit
+        final_df['Is_Hit'] = final_df['Z_score'].apply(lambda x: "Yes" if x < Z_THRESHOLD else "No")
 
-            # ==========================
-            # 可视化
-            # ==========================
-            st.divider()
-            c1, c2, c3 = st.columns(3)
-            c1.metric("平均比值 (Mean Ratio)", f"{mu:.4f}")
-            c2.metric("标准差 (Std)", f"{sigma:.4f}")
-            c3.metric("发现 Hits", len(final_res[final_res['Is_Hit'] == "Yes"]))
+        # 关联库信息
+        if lib_file:
+            ldf = pd.read_excel(lib_file) if lib_file.name.endswith('xlsx') else pd.read_csv(lib_file)
+            final_df = pd.merge(final_df, ldf, on=['Plate_ID', 'Well'], how='left')
 
-            st.subheader("📊 筛选散点图 (Z-score 模式)")
-            fig, ax = plt.subplots(figsize=(10, 5))
-            colors = ['red' if x == "Yes" else 'lightgray' for x in final_res['Is_Hit']]
-            ax.scatter(range(len(final_res)), final_res['Z_score'], c=colors, s=10, alpha=0.5)
-            ax.axhline(THRESHOLD_Z, color='blue', linestyle='--', label=f'Threshold (Z={THRESHOLD_Z})')
-            ax.set_ylabel("Z-score")
-            ax.set_xlabel("Compound Index")
-            ax.legend()
-            st.pyplot(fig)
+        # --- 展示结果 ---
+        st.divider()
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("总分析孔数", len(final_df))
+        m2.metric("平均比值", f"{mu:.3f}")
+        m3.metric("筛选标准差", f"{sigma:.3f}")
+        m4.metric("检测到 Hits", len(final_df[final_df['Is_Hit']=='Yes']))
 
-            # 展示结果
-            st.subheader("📋 筛选结果详表")
-            st.dataframe(final_res.sort_values('Z_score').head(50))
-            
-            # 下载
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                final_res.to_excel(writer, index=False)
-            st.download_button("📥 下载全量分析结果", output.getvalue(), "Screening_Zscore_Final.xlsx")
+        # 绘图
+        st.subheader("📊 筛选散点图 (Z-score 分布)")
+        fig, ax = plt.subplots(figsize=(12, 5))
+        hit_data = final_df[final_df['Is_Hit'] == 'Yes']
+        norm_data = final_df[final_df['Is_Hit'] == 'No']
+        
+        ax.scatter(range(len(norm_data)), norm_data['Z_score'], c='lightgray', s=15, alpha=0.6, label='Normal')
+        ax.scatter(range(len(hit_data)), hit_data['Z_score'], c='red', s=30, label='Hits')
+        ax.axhline(Z_THRESHOLD, color='blue', linestyle='--', label=f'Threshold ({Z_THRESHOLD})')
+        ax.set_ylabel("Z-score")
+        ax.set_xlabel("Compound Index")
+        ax.legend()
+        st.pyplot(fig)
 
-        except Exception as e:
-            st.error(f"数据处理失败，请确保文件包含 'Firefly' 和 'Renilla' 列。错误详情: {e}")
+        # 结果表
+        st.subheader("🚩 强效抑制剂清单 (Hits)")
+        hits_display = final_df[final_df['Is_Hit'] == 'Yes'].sort_values('Z_score')
+        st.dataframe(hits_display)
+
+        # 下载按钮
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            final_df.to_excel(writer, index=False, sheet_name='All_Results')
+        st.download_button("📥 下载完整分析报告 (Excel)", output.getvalue(), "FeliEase_3.0_Report.xlsx")
