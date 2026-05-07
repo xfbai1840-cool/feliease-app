@@ -26,43 +26,82 @@ with st.sidebar:
     st.info("注：Z-score < -2 通常代表具有 95% 以上的统计学显著抑制。")
 
 # ==========================================
-# 1. 核心解析函数 (适配原始 96 孔板 CSV)
+# 1. 核心解析函数 (适配“左右双拼”双荧光 CSV)
 # ==========================================
 def parse_raw_csv(file):
-    """解析原始导出的 CSV，提取 ID, F 和 R"""
+    """
+    根据 Discovery 实验室特定版式解析 CSV:
+    左侧 F：B列(1)为溶剂, M列(12)为毒性, C-L列(2:11)为药物
+    右侧 R：P列(15)为溶剂, AA列(26)为毒性, Q-Z列(16:25)为药物
+    计算：Ratio = (Drug_F / Avg_Ctrl_F) / (Drug_R / Avg_Ctrl_R)
+    """
     df = pd.read_csv(file, header=None)
     results = []
     
-    # 自动找板逻辑
     i = 0
-    plate_count = 1
     while i < len(df):
-        val = str(df.iloc[i, 0]).strip()
-        if val and val.lower() != 'nan':  # A列有板ID
+        val_a = str(df.iloc[i, 0]).strip()
+        
+        # 如果 A 列有内容（例如 ZY-3K-1#-F），说明找到了一板的开头
+        if val_a and val_a.lower() != 'nan':
             if i + int(PLATE_ROWS) <= len(df):
-                plate_id = val
-                # 提取 F (B列=1) 和 R (M列=12) 以及中间的药物孔 (C-L列 = 2:12)
-                # 简化逻辑：这里假设用户上传的是已经简单清洗或标准的 96 孔数据分布
-                # 我们遍历 C-L 列 (药物孔)
+                # 清洗 Plate ID（去掉后缀 -F，统一叫 ZY-3K-1#）
+                plate_id = val_a.replace("-F", "").strip()
+                
+                # --- 1. 计算这一板的溶剂对照平均值 (B列和P列) ---
+                ctrl_f_vals = pd.to_numeric(df.iloc[i : i+int(PLATE_ROWS), 1], errors='coerce').dropna()
+                avg_ctrl_f = ctrl_f_vals.mean() if not ctrl_f_vals.empty else 1.0
+                
+                ctrl_r_vals = pd.to_numeric(df.iloc[i : i+int(PLATE_ROWS), 15], errors='coerce').dropna()
+                avg_ctrl_r = ctrl_r_vals.mean() if not ctrl_r_vals.empty else 1.0
+                
+                # --- 2. 计算这一板的毒性底线平均值 (M1~M5 和 AA1~AA5) ---
+                tox_f_vals = pd.to_numeric(df.iloc[i : i+5, 12], errors='coerce').dropna()
+                min_tox_f = tox_f_vals.mean() if not tox_f_vals.empty else 0
+                
+                tox_r_vals = pd.to_numeric(df.iloc[i : i+5, 26], errors='coerce').dropna()
+                min_tox_r = tox_r_vals.mean() if not tox_r_vals.empty else 0
+                
+                # --- 3. 提取 C~L 列 和 Q~Z 列的药物数据 ---
                 for r in range(int(PLATE_ROWS)):
-                    for c in range(2, 12): # C列到L列
-                        f_val = pd.to_numeric(df.iloc[i+r, 1], errors='coerce')  # B列作为单行内参或对照
-                        r_val = pd.to_numeric(df.iloc[i+r, 12], errors='coerce') # M列作为海神内参
-                        drug_f = pd.to_numeric(df.iloc[i+r, c], errors='coerce')
+                    for c_idx in range(10): # 每行 10 个药
+                        col_f = 2 + c_idx  # 对应 C(2) 到 L(11)
+                        col_r = 16 + c_idx # 对应 Q(16) 到 Z(25)
                         
-                        if not np.isnan(drug_f) and r_val > 0:
-                            well_id = f"{chr(65+r)}{c+1:02d}"
+                        raw_f = pd.to_numeric(df.iloc[i+r, col_f], errors='coerce')
+                        raw_r = pd.to_numeric(df.iloc[i+r, col_r], errors='coerce')
+                        
+                        if pd.notna(raw_f) and pd.notna(raw_r):
+                            # 计算相对值
+                            rel_f = raw_f / avg_ctrl_f
+                            rel_r = raw_r / avg_ctrl_r
+                            
+                            # 计算最终核糖体移码效率 (Ratio)
+                            ratio = rel_f / rel_r if rel_r > 0 else np.nan
+                            
+                            # 毒性判定：只要 F 或 R 低于阳性对照平均值，即判定为有毒
+                            is_toxic = "Yes" if (raw_f < min_tox_f or raw_r < min_tox_r) else "No"
+                            
+                            # 生成孔位 ID (例如 A02, A03)
+                            well_id = f"{chr(65+r)}{c_idx+2:02d}"
+                            
                             results.append({
                                 "Plate_ID": plate_id,
                                 "Well": well_id,
-                                "F": drug_f,
-                                "R": r_val,
-                                "Ratio": drug_f / r_val
+                                "Raw_F": raw_f,
+                                "Raw_R": raw_r,
+                                "Rel_F": rel_f,
+                                "Rel_R": rel_r,
+                                "Ratio": ratio,
+                                "Toxicity": is_toxic
                             })
-                plate_count += 1
+                
                 i += int(PLATE_ROWS)
-            else: break
-        else: i += 1
+            else:
+                break
+        else:
+            i += 1
+            
     return pd.DataFrame(results)
 
 # ==========================================
