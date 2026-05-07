@@ -13,18 +13,30 @@ st.title("🧪 FeliEase 3.0 高通量双荧光筛选系统")
 st.markdown("""
 **专为 Discovery 实验室双荧光筛选定制版：**
 - **双重归一化**：$最终移码效率 = (药物 F / 溶剂 F 均值) / (药物 R / 溶剂 R 均值)$。
-- **智能毒性排雷**：低于阳性对照 (M/AA列) 的孔位会被自动标记为毒性，**且不参与全局 Z-score 基线计算**。
+- **智能毒性排雷 (双重保险)**：
+  1. 低于阳性对照 (M/AA列) 的绝对信号底线。
+  2. **海肾(R)相对信号低于设定阈值** (基于 R 位于移码元件上游的生物学特性)。
+  *被判定为有毒的孔位不参与全局 Z-score 基线计算。*
 - **真实孔位映射**：自动将 Excel 坐标转换为物理 96 孔板药物编号 (如 A2, B2, C4)。
-- **多样本合并**：支持 3 次重复实验自动合并与变异系数 (CV) 评估。
 """)
 
 # 侧边栏参数
 with st.sidebar:
     st.header("⚙️ 分析参数设置")
     PLATE_ROWS = st.number_input("板内数据行数 (如 A-H 共8行)", value=8)
+    
     st.divider()
+    st.subheader("🎯 筛选与毒性阈值")
     Z_THRESHOLD = st.slider("Hit 判定阈值 (Z-score < ?)", -5.0, 0.0, -2.0, 0.1)
-    st.info("注：Z-score < -2 代表化合物对核糖体移码效率有极其显著的抑制作用。")
+    
+    # 新增：海肾信号下降阈值滑块
+    RENILLA_THRESHOLD = st.slider(
+        "海肾(R)最低保留比例", 
+        min_value=0.0, max_value=1.0, value=0.5, step=0.05,
+        help="海肾位于移码元件上游，代表全局翻译水平。如果药物孔的海肾信号低于对照孔的该比例（如0.5即50%），则直接判定为非特异性毒性/抑制剂。"
+    )
+    
+    st.info(f"当前策略：Z-score < {Z_THRESHOLD} 且 海肾保留率 > {RENILLA_THRESHOLD*100:.0f}% 才算有效 Hit。")
 
 # ==========================================
 # 1. 核心解析函数 (Discovery 实验室特定版式)
@@ -41,7 +53,7 @@ def parse_raw_csv(file):
     while i < len(df):
         val_a = str(df.iloc[i, 0]).strip()
         
-        # 寻找每板起始标志 (如 ZY-3K-1#-F)
+        # 寻找每板起始标志
         if val_a and val_a.lower() != 'nan':
             if i + int(PLATE_ROWS) <= len(df):
                 plate_id = val_a.replace("-F", "").replace("-R", "").strip()
@@ -60,9 +72,9 @@ def parse_raw_csv(file):
                 tox_r_vals = pd.to_numeric(df.iloc[i : i+5, 26], errors='coerce').dropna()
                 min_tox_r = tox_r_vals.mean() if not tox_r_vals.empty else 0
                 
-                # --- 3. 提取药物数据并计算 (C~L 和 Q~Z) ---
+                # --- 3. 提取药物数据并计算 ---
                 for r in range(int(PLATE_ROWS)):
-                    for c_idx in range(10): # 每行10个药
+                    for c_idx in range(10): 
                         col_f = 2 + c_idx
                         col_r = 16 + c_idx
                         
@@ -77,12 +89,15 @@ def parse_raw_csv(file):
                             # 核糖体移码效率
                             ratio = rel_f / rel_r if rel_r > 0 else np.nan
                             
-                            # 毒性判定
-                            is_toxic = "Yes" if (raw_f < min_tox_f or raw_r < min_tox_r) else "No"
+                            # 🎯 毒性判定 (双重保险)
+                            # 1. 绝对信号值低于阳性对照的底线
+                            # 2. 或者相对海肾信号(全局翻译能力)降幅超过了设定的滑块阈值
+                            if (raw_f < min_tox_f) or (raw_r < min_tox_r) or (rel_r < RENILLA_THRESHOLD):
+                                is_toxic = "Yes"
+                            else:
+                                is_toxic = "No"
                             
-                            # 🎯 核心修正：生成真实的物理孔板药物编号
-                            # r=0 -> A, r=1 -> B, r=2 -> C ...
-                            # col_f=2 -> 2, col_f=4 -> 4 ... 完美对应！
+                            # 生成真实的物理孔板药物编号 (如 A2, B2)
                             drug_id = f"{chr(65+r)}{col_f}" 
                             
                             results.append({
@@ -140,7 +155,7 @@ if uploaded_files:
         healthy_df = final_df[final_df['Toxicity'] == 'No']
         
         if healthy_df.empty:
-            st.error("⚠️ 警告：所有孔位均被判定为有毒！无法计算基线。请检查数据或阳性对照是否异常。")
+            st.error("⚠️ 警告：所有孔位均被判定为有毒！请检查数据或调低左侧的【海肾最低保留比例】阈值。")
         else:
             mu = healthy_df['Avg_Ratio'].mean()
             sigma = healthy_df['Avg_Ratio'].std()
@@ -175,7 +190,7 @@ if uploaded_files:
             
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("总筛药孔数", total_drugs)
-            m2.metric("被剔除的毒性假阳性", toxic_drugs)
+            m2.metric("被剔除的毒性/假阳性", toxic_drugs)
             m3.metric("健康基线均值 (Mean Ratio)", f"{mu:.3f}")
             m4.metric("有效抑制剂 (Hits)", hit_drugs)
 
@@ -188,8 +203,8 @@ if uploaded_files:
             toxic = final_df[final_df['Toxicity'] == 'Yes']
             
             ax.scatter(normal.index, normal['Z_score'], c='#A0AEC0', s=15, alpha=0.5, label='Normal')
-            ax.scatter(toxic.index, toxic['Z_score'], c='#ED8936', s=15, marker='x', alpha=0.8, label='Toxic (Discarded)')
-            ax.scatter(hits.index, hits['Z_score'], c='#E53E3E', s=35, label='Hits')
+            ax.scatter(toxic.index, toxic['Z_score'], c='#ED8936', s=15, marker='x', alpha=0.8, label='Toxic / Translation Inhibitor')
+            ax.scatter(hits.index, hits['Z_score'], c='#E53E3E', s=35, label='Specific Hits')
             
             ax.axhline(Z_THRESHOLD, color='#3182CE', linestyle='--', label=f'Hit Threshold (Z={Z_THRESHOLD})')
             ax.axhline(0, color='black', linewidth=0.8, alpha=0.5)
@@ -201,7 +216,7 @@ if uploaded_files:
             st.pyplot(fig)
 
             # 结果表格
-            st.subheader("🚩 强效抑制剂清单 (仅展示健康 Hits)")
+            st.subheader("🚩 强效抑制剂清单 (仅展示特异性 Hits)")
             display_cols = ['Plate_ID', '药物编号', 'Z_score', 'Avg_Ratio', 'CV_%', 'Mean_Rel_F', 'Mean_Rel_R', 'Result']
             if 'Product Name' in final_df.columns: display_cols.insert(2, 'Product Name')
             
