@@ -14,6 +14,7 @@ st.markdown("""
 **专为 Discovery 实验室双荧光筛选定制版：**
 - **双重归一化**：$最终移码效率 = (药物 F / 溶剂 F 均值) / (药物 R / 溶剂 R 均值)$。
 - **智能毒性排雷**：低于阳性对照 (M/AA列) 的孔位会被自动标记为毒性，**且不参与全局 Z-score 基线计算**。
+- **真实孔位映射**：自动将 Excel 坐标转换为物理 96 孔板药物编号 (如 A2, B2, C4)。
 - **多样本合并**：支持 3 次重复实验自动合并与变异系数 (CV) 评估。
 """)
 
@@ -79,17 +80,17 @@ def parse_raw_csv(file):
                             # 毒性判定
                             is_toxic = "Yes" if (raw_f < min_tox_f or raw_r < min_tox_r) else "No"
                             
-                            # 🎯 生成药物编号：
-                            # 根据您的描述，Excel的 C1 (r=0, c_idx=0) 对应 编号B1
-                            # chr(66) 是 'B'。如果您其实想让它对应 A1，把下面的 66 改成 65 即可。
-                            drug_id = f"{chr(66+r)}{c_idx+1}" 
+                            # 🎯 核心修正：生成真实的物理孔板药物编号
+                            # r=0 -> A, r=1 -> B, r=2 -> C ...
+                            # col_f=2 -> 2, col_f=4 -> 4 ... 完美对应！
+                            drug_id = f"{chr(65+r)}{col_f}" 
                             
                             results.append({
                                 "Plate_ID": plate_id,
                                 "药物编号": drug_id,
                                 "Raw_F": raw_f,
                                 "Raw_R": raw_r,
-                                "Rel_F": rel_f,  # 记录相对信号以备核查
+                                "Rel_F": rel_f,
                                 "Rel_R": rel_r,
                                 "Ratio": ratio,
                                 "Toxicity": is_toxic
@@ -120,14 +121,13 @@ if uploaded_files:
     if all_reps:
         combined_raw = pd.concat(all_reps)
         
-        # 聚合重复实验数据，使用“药物编号”代替“Well”
+        # 聚合重复实验数据
         final_df = combined_raw.groupby(['Plate_ID', '药物编号']).agg({
             'Ratio': ['mean', 'std'],
             'Rel_F': 'mean',
             'Rel_R': 'mean',
             'Raw_F': 'mean',
             'Raw_R': 'mean',
-            # 只要在任何一次重复中判定为有毒，整体就标记为有毒
             'Toxicity': lambda x: 'Yes' if 'Yes' in x.values else 'No'
         }).reset_index()
         
@@ -135,7 +135,7 @@ if uploaded_files:
         final_df['CV_%'] = (final_df['Std_Ratio'] / final_df['Avg_Ratio']) * 100
         
         # -----------------------------------------------------
-        # 核心改进：剔除毒性孔后，计算全局基线均值和标准差
+        # 剔除毒性孔后，计算全局基线均值和标准差
         # -----------------------------------------------------
         healthy_df = final_df[final_df['Toxicity'] == 'No']
         
@@ -148,7 +148,7 @@ if uploaded_files:
             # 对所有孔计算 Z-score
             final_df['Z_score'] = (final_df['Avg_Ratio'] - mu) / sigma
             
-            # Hit 判定分类逻辑
+            # Hit 判定分类
             def determine_hit(row):
                 if row['Toxicity'] == 'Yes':
                     return 'Toxic (Excluded)'
@@ -162,7 +162,6 @@ if uploaded_files:
             # 合并化合物库
             if lib_file:
                 ldf = pd.read_excel(lib_file) if lib_file.name.endswith('xlsx') else pd.read_csv(lib_file)
-                # 统一列名以确保匹配，将库中的坐标列与我们的“药物编号”对齐
                 ldf.rename(columns={'Physical_Plate': 'Plate_ID', 'Physical_Well': '药物编号', 'Well': '药物编号'}, inplace=True)
                 final_df = pd.merge(final_df, ldf, on=['Plate_ID', '药物编号'], how='left')
 
@@ -184,7 +183,6 @@ if uploaded_files:
             st.subheader("📊 筛选散点图 (基线与抑制效果)")
             fig, ax = plt.subplots(figsize=(12, 5))
             
-            # 分类画点
             hits = final_df[final_df['Result'] == 'Yes (Hit)']
             normal = final_df[final_df['Result'] == 'No']
             toxic = final_df[final_df['Toxicity'] == 'Yes']
@@ -204,9 +202,7 @@ if uploaded_files:
 
             # 结果表格
             st.subheader("🚩 强效抑制剂清单 (仅展示健康 Hits)")
-            # 优化展示列的顺序，优先展示核心指标
             display_cols = ['Plate_ID', '药物编号', 'Z_score', 'Avg_Ratio', 'CV_%', 'Mean_Rel_F', 'Mean_Rel_R', 'Result']
-            # 如果有化合物库的名字，也加进去
             if 'Product Name' in final_df.columns: display_cols.insert(2, 'Product Name')
             
             hits_display = final_df[final_df['Result'] == 'Yes (Hit)'].sort_values('Z_score')
@@ -215,7 +211,6 @@ if uploaded_files:
             # 下载
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                # 按照类别排序，先看 Hit，再看 Normal，最后是有毒的
                 export_df = final_df.sort_values(by=['Result', 'Z_score'], ascending=[True, True])
                 export_df.to_excel(writer, index=False, sheet_name='All_Screen_Results')
                 
