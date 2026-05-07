@@ -11,29 +11,27 @@ st.set_page_config(page_title="FeliEase 3.0 | 双荧光重复分析", layout="wi
 
 st.title("🧪 FeliEase 3.0 高通量双荧光筛选系统")
 st.markdown("""
-该版本专为**重复实验**设计：
-1. **自动归一化**：计算 $Ratio = Firefly / Renilla$。
-2. **多样本合并**：上传 3 个重复文件，自动按孔位计算均值与偏差。
-3. **Z-score 统计**：基于整板数据计算 $Z = (x - \mu) / \sigma$，科学评估抑制强度。
+**专为 Discovery 实验室双荧光筛选定制版：**
+- **双重归一化**：$Ratio = (Drug\_F / Ctrl\_F) / (Drug\_R / Ctrl\_R)$。
+- **智能毒性排雷**：低于阳性对照 (M/AA列) 的孔位会被自动标记为毒性，**且不参与全局 Z-score 基线计算**，确保统计学极其严谨。
+- **多样本合并**：支持 3 次重复实验自动合并与变异系数 (CV) 评估。
 """)
 
 # 侧边栏参数
 with st.sidebar:
     st.header("⚙️ 分析参数设置")
-    PLATE_ROWS = st.number_input("板内数据行数 (如 B-M 共12行则填12)", value=8)
+    PLATE_ROWS = st.number_input("板内数据行数 (如 A-H 共8行)", value=8)
     st.divider()
     Z_THRESHOLD = st.slider("Hit 判定阈值 (Z-score < ?)", -5.0, 0.0, -2.0, 0.1)
-    st.info("注：Z-score < -2 通常代表具有 95% 以上的统计学显著抑制。")
+    st.info("注：Z-score < -2 代表化合物对核糖体移码效率有极其显著的抑制作用。")
 
 # ==========================================
-# 1. 核心解析函数 (适配“左右双拼”双荧光 CSV)
+# 1. 核心解析函数 (Discovery 实验室特定版式)
 # ==========================================
 def parse_raw_csv(file):
     """
-    根据 Discovery 实验室特定版式解析 CSV:
     左侧 F：B列(1)为溶剂, M列(12)为毒性, C-L列(2:11)为药物
     右侧 R：P列(15)为溶剂, AA列(26)为毒性, Q-Z列(16:25)为药物
-    计算：Ratio = (Drug_F / Avg_Ctrl_F) / (Drug_R / Avg_Ctrl_R)
     """
     df = pd.read_csv(file, header=None)
     results = []
@@ -42,60 +40,51 @@ def parse_raw_csv(file):
     while i < len(df):
         val_a = str(df.iloc[i, 0]).strip()
         
-        # 如果 A 列有内容（例如 ZY-3K-1#-F），说明找到了一板的开头
+        # 寻找每板起始标志 (如 ZY-3K-1#-F)
         if val_a and val_a.lower() != 'nan':
             if i + int(PLATE_ROWS) <= len(df):
-                # 清洗 Plate ID（去掉后缀 -F，统一叫 ZY-3K-1#）
-                plate_id = val_a.replace("-F", "").strip()
+                plate_id = val_a.replace("-F", "").replace("-R", "").strip()
                 
-                # --- 1. 计算这一板的溶剂对照平均值 (B列和P列) ---
+                # --- 1. 计算溶剂对照平均值 ---
                 ctrl_f_vals = pd.to_numeric(df.iloc[i : i+int(PLATE_ROWS), 1], errors='coerce').dropna()
                 avg_ctrl_f = ctrl_f_vals.mean() if not ctrl_f_vals.empty else 1.0
                 
                 ctrl_r_vals = pd.to_numeric(df.iloc[i : i+int(PLATE_ROWS), 15], errors='coerce').dropna()
                 avg_ctrl_r = ctrl_r_vals.mean() if not ctrl_r_vals.empty else 1.0
                 
-                # --- 2. 计算这一板的毒性底线平均值 (M1~M5 和 AA1~AA5) ---
+                # --- 2. 计算毒性底线平均值 (M1~M5 和 AA1~AA5) ---
                 tox_f_vals = pd.to_numeric(df.iloc[i : i+5, 12], errors='coerce').dropna()
                 min_tox_f = tox_f_vals.mean() if not tox_f_vals.empty else 0
                 
                 tox_r_vals = pd.to_numeric(df.iloc[i : i+5, 26], errors='coerce').dropna()
                 min_tox_r = tox_r_vals.mean() if not tox_r_vals.empty else 0
                 
-                # --- 3. 提取 C~L 列 和 Q~Z 列的药物数据 ---
+                # --- 3. 提取药物数据 (C~L 和 Q~Z) ---
                 for r in range(int(PLATE_ROWS)):
-                    for c_idx in range(10): # 每行 10 个药
-                        col_f = 2 + c_idx  # 对应 C(2) 到 L(11)
-                        col_r = 16 + c_idx # 对应 Q(16) 到 Z(25)
+                    for c_idx in range(10): # 每行10个药
+                        col_f = 2 + c_idx
+                        col_r = 16 + c_idx
                         
                         raw_f = pd.to_numeric(df.iloc[i+r, col_f], errors='coerce')
                         raw_r = pd.to_numeric(df.iloc[i+r, col_r], errors='coerce')
                         
                         if pd.notna(raw_f) and pd.notna(raw_r):
-                            # 计算相对值
                             rel_f = raw_f / avg_ctrl_f
                             rel_r = raw_r / avg_ctrl_r
-                            
-                            # 计算最终核糖体移码效率 (Ratio)
                             ratio = rel_f / rel_r if rel_r > 0 else np.nan
                             
-                            # 毒性判定：只要 F 或 R 低于阳性对照平均值，即判定为有毒
+                            # 毒性判定
                             is_toxic = "Yes" if (raw_f < min_tox_f or raw_r < min_tox_r) else "No"
-                            
-                            # 生成孔位 ID (例如 A02, A03)
-                            well_id = f"{chr(65+r)}{c_idx+2:02d}"
+                            well_id = f"{chr(65+r)}{c_idx+2:02d}" # B列是1，药物从C列开始即02
                             
                             results.append({
                                 "Plate_ID": plate_id,
                                 "Well": well_id,
                                 "Raw_F": raw_f,
                                 "Raw_R": raw_r,
-                                "Rel_F": rel_f,
-                                "Rel_R": rel_r,
                                 "Ratio": ratio,
                                 "Toxicity": is_toxic
                             })
-                
                 i += int(PLATE_ROWS)
             else:
                 break
@@ -109,75 +98,114 @@ def parse_raw_csv(file):
 # ==========================================
 col_u1, col_u2 = st.columns([2, 1])
 with col_u1:
-    uploaded_files = st.file_uploader("1️⃣ 上传重复实验文件 (支持多个 CSV)", type="csv", accept_multiple_files=True)
+    uploaded_files = st.file_uploader("1️⃣ 上传重复实验文件 (支持上传3个 CSV 自动合并)", type="csv", accept_multiple_files=True)
 with col_u2:
-    lib_file = st.file_uploader("2️⃣ 可选：上传化合物库信息", type=["xlsx", "csv"])
+    lib_file = st.file_uploader("2️⃣ 可选：上传化合物库信息表", type=["xlsx", "csv"])
 
 if uploaded_files:
     all_reps = []
     for idx, f in enumerate(uploaded_files):
         rep_df = parse_raw_csv(f)
-        rep_df['Rep'] = f"Rep_{idx+1}"
         all_reps.append(rep_df)
     
     if all_reps:
         combined_raw = pd.concat(all_reps)
         
-        # 按板号和孔位进行聚合计算
+        # 聚合重复实验数据
         final_df = combined_raw.groupby(['Plate_ID', 'Well']).agg({
-            'Ratio': ['mean', 'std', 'count'],
-            'F': 'mean',
-            'R': 'mean'
+            'Ratio': ['mean', 'std'],
+            'Raw_F': 'mean',
+            'Raw_R': 'mean',
+            # 只要在任何一次重复中判定为有毒，整体就标记为有毒
+            'Toxicity': lambda x: 'Yes' if 'Yes' in x.values else 'No'
         }).reset_index()
         
-        # 展平列名
-        final_df.columns = ['Plate_ID', 'Well', 'Avg_Ratio', 'Std_Ratio', 'Count', 'Mean_F', 'Mean_R']
-        
-        # 计算变异系数 CV (衡量重复性)
+        final_df.columns = ['Plate_ID', 'Well', 'Avg_Ratio', 'Std_Ratio', 'Mean_F', 'Mean_R', 'Toxicity']
         final_df['CV_%'] = (final_df['Std_Ratio'] / final_df['Avg_Ratio']) * 100
         
-        # 计算全局 Z-score
-        mu = final_df['Avg_Ratio'].mean()
-        sigma = final_df['Avg_Ratio'].std()
-        final_df['Z_score'] = (final_df['Avg_Ratio'] - mu) / sigma
+        # -----------------------------------------------------
+        # 核心改进：剔除毒性孔后，计算全局基线均值和标准差
+        # -----------------------------------------------------
+        healthy_df = final_df[final_df['Toxicity'] == 'No']
         
-        # 判定 Hit
-        final_df['Is_Hit'] = final_df['Z_score'].apply(lambda x: "Yes" if x < Z_THRESHOLD else "No")
+        if healthy_df.empty:
+            st.error("⚠️ 警告：所有孔位均被判定为有毒！无法计算基线。请检查数据或阳性对照是否异常。")
+        else:
+            mu = healthy_df['Avg_Ratio'].mean()
+            sigma = healthy_df['Avg_Ratio'].std()
+            
+            # 对所有孔计算 Z-score
+            final_df['Z_score'] = (final_df['Avg_Ratio'] - mu) / sigma
+            
+            # Hit 判定分类逻辑
+            def determine_hit(row):
+                if row['Toxicity'] == 'Yes':
+                    return 'Toxic (Excluded)'
+                elif row['Z_score'] < Z_THRESHOLD:
+                    return 'Yes (Hit)'
+                else:
+                    return 'No'
+                    
+            final_df['Result'] = final_df.apply(determine_hit, axis=1)
 
-        # 关联库信息
-        if lib_file:
-            ldf = pd.read_excel(lib_file) if lib_file.name.endswith('xlsx') else pd.read_csv(lib_file)
-            final_df = pd.merge(final_df, ldf, on=['Plate_ID', 'Well'], how='left')
+            # 合并化合物库
+            if lib_file:
+                ldf = pd.read_excel(lib_file) if lib_file.name.endswith('xlsx') else pd.read_csv(lib_file)
+                # 统一列名以确保匹配
+                ldf.rename(columns={'Physical_Plate': 'Plate_ID', 'Physical_Well': 'Well'}, inplace=True)
+                final_df = pd. pd.merge(final_df, ldf, on=['Plate_ID', 'Well'], how='left')
 
-        # --- 展示结果 ---
-        st.divider()
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("总分析孔数", len(final_df))
-        m2.metric("平均比值", f"{mu:.3f}")
-        m3.metric("筛选标准差", f"{sigma:.3f}")
-        m4.metric("检测到 Hits", len(final_df[final_df['Is_Hit']=='Yes']))
+            # ==========================
+            # 界面展示
+            # ==========================
+            st.divider()
+            total_wells = len(final_df)
+            toxic_wells = len(final_df[final_df['Toxicity'] == 'Yes'])
+            hit_wells = len(final_df[final_df['Result'] == 'Yes (Hit)'])
+            
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("总筛药孔数", total_wells)
+            m2.metric("被剔除的毒性假阳性", toxic_wells)
+            m3.metric("健康基线均值 (Mean Ratio)", f"{mu:.3f}")
+            m4.metric("有效抑制剂 (Hits)", hit_wells)
 
-        # 绘图
-        st.subheader("📊 筛选散点图 (Z-score 分布)")
-        fig, ax = plt.subplots(figsize=(12, 5))
-        hit_data = final_df[final_df['Is_Hit'] == 'Yes']
-        norm_data = final_df[final_df['Is_Hit'] == 'No']
-        
-        ax.scatter(range(len(norm_data)), norm_data['Z_score'], c='lightgray', s=15, alpha=0.6, label='Normal')
-        ax.scatter(range(len(hit_data)), hit_data['Z_score'], c='red', s=30, label='Hits')
-        ax.axhline(Z_THRESHOLD, color='blue', linestyle='--', label=f'Threshold ({Z_THRESHOLD})')
-        ax.set_ylabel("Z-score")
-        ax.set_xlabel("Compound Index")
-        ax.legend()
-        st.pyplot(fig)
+            # 绘图展示
+            st.subheader("📊 筛选散点图 (基线与抑制效果)")
+            fig, ax = plt.subplots(figsize=(12, 5))
+            
+            # 分类画点
+            hits = final_df[final_df['Result'] == 'Yes (Hit)']
+            normal = final_df[final_df['Result'] == 'No']
+            toxic = final_df[final_df['Toxicity'] == 'Yes']
+            
+            ax.scatter(normal.index, normal['Z_score'], c='#A0AEC0', s=15, alpha=0.5, label='Normal')
+            ax.scatter(toxic.index, toxic['Z_score'], c='#ED8936', s=15, marker='x', alpha=0.8, label='Toxic (Discarded)')
+            ax.scatter(hits.index, hits['Z_score'], c='#E53E3E', s=35, label='Hits')
+            
+            ax.axhline(Z_THRESHOLD, color='#3182CE', linestyle='--', label=f'Hit Threshold (Z={Z_THRESHOLD})')
+            ax.axhline(0, color='black', linewidth=0.8, alpha=0.5)
+            
+            ax.set_ylabel("Z-score")
+            ax.set_xlabel("Compound Sequence Index")
+            ax.legend(loc='upper right')
+            ax.grid(True, linestyle=':', alpha=0.4)
+            st.pyplot(fig)
 
-        # 结果表
-        st.subheader("🚩 强效抑制剂清单 (Hits)")
-        hits_display = final_df[final_df['Is_Hit'] == 'Yes'].sort_values('Z_score')
-        st.dataframe(hits_display)
+            # 结果表格
+            st.subheader("🚩 强效抑制剂清单 (仅展示健康 Hits)")
+            hits_display = final_df[final_df['Result'] == 'Yes (Hit)'].sort_values('Z_score')
+            st.dataframe(hits_display)
 
-        # 下载按钮
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            final_df.to_excel(writer, index=False, sheet_name='All_Results')
-        st.download_button("📥 下载完整分析报告 (Excel)", output.getvalue(), "FeliEase_3.0_Report.xlsx")
+            # 下载
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                # 按照类别排序，先看 Hit，再看 Normal，最后是有毒的
+                export_df = final_df.sort_values(by=['Result', 'Z_score'], ascending=[True, True])
+                export_df.to_excel(writer, index=False, sheet_name='All_Screen_Results')
+                
+            st.download_button(
+                label="📥 下载带有毒性标记的完整报告 (Excel)", 
+                data=output.getvalue(), 
+                file_name="Discovery_Dual_Luciferase_Report.xlsx",
+                type="primary"
+            )
